@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+name=workutils-intune-test-$$
+
+bash -n "$root/browser" "$root/container-init" "$root/container-session"
+docker create --name "$name" \
+    --security-opt "seccomp=$root/browser-seccomp.json" \
+    --tmpfs /run:rw,nosuid,nodev,mode=0755 \
+    --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+    workutils-intune-browser:local >/dev/null
+
+cleanup() {
+    local result=$?
+    trap - EXIT
+    if ((result)); then docker logs --tail 60 "$name" >&2; fi
+    docker rm --force "$name" >/dev/null
+    exit "$result"
+}
+trap cleanup EXIT
+
+wait_ready() {
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        if docker exec "$name" test -f /run/intune-browser-ready; then return; fi
+        if [[ $(docker inspect --format '{{.State.Running}}' "$name") != true ]]; then
+            printf 'Error: container exited during startup.\n' >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+    printf 'Error: services were not ready within 10 seconds.\n' >&2
+    return 1
+}
+
+docker start "$name" >/dev/null
+wait_ready
+first_id=$(docker exec "$name" cat /etc/machine-id)
+[[ "$first_id" =~ ^[0-9a-f]{32}$ ]]
+docker exec "$name" pgrep -f '^/opt/microsoft/intune/bin/intune-daemon$' >/dev/null
+docker exec --user browser --env HOME=/home/browser \
+    --env XDG_RUNTIME_DIR=/run/user/1000 "$name" dbus-run-session -- bash -euc '
+        mkdir -p /home/browser/test-bin
+        printf "#!/bin/sh\nprintf fixture-password\n" > /home/browser/test-bin/zenity
+        chmod +x /home/browser/test-bin/zenity
+        export PATH=/home/browser/test-bin:$PATH
+        /usr/local/bin/container-session check-keyring
+        alias=$(busctl --address="$DBUS_SESSION_BUS_ADDRESS" call org.freedesktop.secrets \
+            /org/freedesktop/secrets org.freedesktop.Secret.Service ReadAlias s login)
+        test "$alias" != "o \"/\""
+    '
+docker exec "$name" sh -ec \
+    'printf "workutils-journal-smoke\n" | systemd-cat -t workutils-test; journalctl --sync'
+journal=$(docker exec "$name" journalctl --no-pager -t workutils-test --output=cat)
+[[ "$journal" == *workutils-journal-smoke* ]]
+
+html=$(timeout --kill-after=5 30 docker exec --user browser \
+    --env HOME=/home/browser --env XDG_RUNTIME_DIR=/run/user/1000 \
+    "$name" dbus-run-session -- microsoft-edge \
+    --headless --disable-gpu --password-store=basic \
+    --dump-dom 'data:text/html,<h1>workutils-smoke</h1>')
+[[ "$html" == *'<h1>workutils-smoke</h1>'* ]]
+
+docker stop --timeout 10 "$name" >/dev/null
+[[ $(docker inspect --format '{{.State.ExitCode}}' "$name") == 0 ]]
+docker start "$name" >/dev/null
+wait_ready
+[[ $(docker exec "$name" cat /etc/machine-id) == "$first_id" ]]
+journal=$(docker exec "$name" journalctl --no-pager -t workutils-test --output=cat)
+[[ "$journal" == *workutils-journal-smoke* ]]
+docker stop --timeout 10 "$name" >/dev/null
+[[ $(docker inspect --format '{{.State.ExitCode}}' "$name") == 0 ]]
+printf 'Passed: service startup, login-keyring repair, sandboxed HTML rendering, persistent machine ID and journal, and clean shutdown.\n'

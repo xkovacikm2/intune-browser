@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ ! -s /etc/machine-id ]]; then dbus-uuidgen > /etc/machine-id; fi
+dbus-uuidgen --ensure=/etc/machine-id
+install -d -m 0755 /run/dbus
+install -d -m 0711 /run/intune
+install -d -m 0700 /var/lib/intune
+install -d -o browser -g browser -m 0700 /run/user/1000
+install -d -m 0755 /run/systemd/journal /var/log/journal /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/intune-browser.conf <<'EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=32M
+RuntimeMaxUse=8M
+EOF
+ln -sfn /run/systemd/journal/dev-log /dev/log
+
+pids=()
+cleanup() {
+    local result=$?
+    trap - EXIT
+    if ((${#pids[@]})); then
+        for pid in "${pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid"; fi
+        done
+        for pid in "${pids[@]}"; do
+            if wait "$pid"; then :; else
+                printf 'Service PID %s exited during shutdown.\n' "$pid" >&2
+            fi
+        done
+    fi
+    exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 0' TERM INT
+
+/usr/lib/systemd/systemd-journald &
+pids+=("$!")
+for ((attempt = 0; attempt < 50; attempt++)); do
+    [[ -S /run/systemd/journal/socket ]] && break
+    sleep 0.1
+done
+[[ -S /run/systemd/journal/socket ]] || {
+    printf 'Error: private system journal did not start.\n' >&2
+    exit 1
+}
+journalctl --flush
+journalctl --follow --lines=0 --no-pager --output=short &
+pids+=("$!")
+
+dbus-daemon --system --nofork --nopidfile &
+pids+=("$!")
+for ((attempt = 0; attempt < 50; attempt++)); do
+    [[ -S /run/dbus/system_bus_socket ]] && break
+    sleep 0.1
+done
+[[ -S /run/dbus/system_bus_socket ]] || {
+    printf 'Error: system D-Bus did not start.\n' >&2
+    exit 1
+}
+
+/opt/microsoft/identity-broker/bin/microsoft-identity-device-broker &
+pids+=("$!")
+/opt/microsoft/intune/bin/intune-daemon &
+pids+=("$!")
+for ((attempt = 0; attempt < 50; attempt++)); do
+    [[ -S /run/intune/daemon.socket ]] && break
+    sleep 0.1
+done
+[[ -S /run/intune/daemon.socket ]] || {
+    printf 'Error: Intune daemon socket did not start.\n' >&2
+    exit 1
+}
+chmod 0666 /run/intune/daemon.socket
+broker_ready=false
+for ((attempt = 0; attempt < 100; attempt++)); do
+    if busctl --system --quiet status com.microsoft.identity.devicebroker1 >/dev/null 2>&1; then
+        broker_ready=true
+        break
+    fi
+    sleep 0.1
+done
+if ! $broker_ready; then
+    printf 'Error: Microsoft identity device broker did not acquire its D-Bus name.\n' >&2
+    exit 1
+fi
+touch /run/intune-browser-ready
+
+set +e
+wait -n "${pids[@]}"
+result=$?
+set -e
+printf 'Error: a required container service exited (status %s).\n' "$result" >&2
+exit 1
