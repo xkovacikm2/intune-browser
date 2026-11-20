@@ -47,6 +47,13 @@ Then open Edge and sign into its work profile using the same organization accoun
 Close all Edge windows to stop the container. Background mode is disabled. Only
 one session can run at a time. `./browser stop` also stops a session.
 
+## Downloads
+
+Edge's default download folder, `/home/browser/Downloads`, shares the host's
+`~/Downloads` read-write. Files saved there appear immediately on the host and
+remain after the container stops. The launcher creates the host directory if
+needed. The container can also read, change, or delete files already there.
+
 ## Persistence and updates
 
 The stopped container `workutils-intune-browser` retains its own machine ID,
@@ -72,8 +79,8 @@ container as an image.
 
 - Root services run inside the container; Edge and the portal run as UID 1000.
 - The container has a private system bus and each launch has a private session
-  bus and keyring service. The host's home directory and enrollment are not
-  mounted.
+  bus and keyring service. Only `~/Downloads` is shared from the host's home;
+  the rest of the home directory and the host's enrollment are not mounted.
 - X11 access uses a temporary copy of your display cookie, not `xhost +`.
   **X11 clients can observe or interact with other applications on that display.**
   This is not a strong desktop isolation boundary.

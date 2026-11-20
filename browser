@@ -87,15 +87,24 @@ if [[ "$action" == open || "$action" == enroll ]]; then
     [[ -S /tmp/.X11-unix/X$display_number ]] || fail "The host X11 socket is missing."
 fi
 
+downloads=$HOME/Downloads
 if ! $exists; then
     docker image inspect "$image" >/dev/null 2>&1 || fail "Build the image first: ./browser build"
+    mkdir -p -- "$downloads"
+    userns=()
+    if [[ $(docker --version) == 'podman version '* && $(docker info --format '{{.Host.Security.Rootless}}') == true ]]; then
+        # Map browser (UID 1000) to the host user, but start the init services as root.
+        userns=(--userns=keep-id:uid=1000,gid=1000 --user 0:0)
+    fi
     docker create --name "$container" --hostname intune-browser \
         --label "$label=1" \
+        "${userns[@]}" \
         --security-opt "seccomp=$root/browser-seccomp.json" \
         --shm-size 256m \
         --tmpfs /run:rw,nosuid,nodev,mode=0755 \
         --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
         --mount type=bind,source=/tmp/.X11-unix,target=/tmp/.X11-unix,readonly \
+        --mount "type=bind,source=$downloads,target=/home/browser/Downloads" \
         "$image" >/dev/null
 fi
 
